@@ -51,6 +51,9 @@ logger = init_logger(__name__)
 class NixlBaseConnectorScheduler:
     """Base implementation of Scheduler side methods shared by pull and push."""
 
+    # Connector mode advertised to the bootstrap server for router discovery.
+    kv_connector_mode: str = "pull"
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -100,6 +103,9 @@ class NixlBaseConnectorScheduler:
         # Background thread for handling new handshake requests.
         self._nixl_handshake_listener_t: threading.Thread | None = None
         self._stop_event = threading.Event()
+
+        # HTTP bootstrap server advertising this engine's identity for discovery.
+        self._bootstrap_server: Any | None = None
 
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
@@ -166,8 +172,50 @@ class NixlBaseConnectorScheduler:
                 self.decoder_kv_blocks_ttl,
             )
 
+        self._maybe_start_bootstrap()
+
+    def _maybe_start_bootstrap(self) -> None:
+        # Only prefill (producer) engines advertise their coordinates: the router
+        # discovers P here and hands them to D. Mirrors Mooncake and avoids
+        # binding the bootstrap port twice when P and D share a host.
+        assert self.vllm_config.kv_transfer_config is not None
+        if self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
+            return
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.bootstrap import (
+            NixlBootstrapServer,
+            NixlEngineInfo,
+            get_nixl_bootstrap_addr,
+            get_nixl_dp_engine_index,
+            register_engine_with_bootstrap,
+            should_launch_nixl_bootstrap_server,
+        )
+
+        parallel_config = self.vllm_config.parallel_config
+        host, port = get_nixl_bootstrap_addr(self.vllm_config)
+        if should_launch_nixl_bootstrap_server(self.vllm_config):
+            self._bootstrap_server = NixlBootstrapServer("0.0.0.0", port)
+            self._bootstrap_server.start()
+
+        info = NixlEngineInfo(
+            engine_id=self.engine_id,
+            host=self.side_channel_host,
+            port=self.side_channel_port,
+            tp_size=parallel_config.tensor_parallel_size,
+            kv_connector=self.kv_connector_mode,
+        )
+        threading.Thread(
+            target=register_engine_with_bootstrap,
+            args=(host, port, get_nixl_dp_engine_index(parallel_config), info),
+            daemon=True,
+            name="nixl_bootstrap_register",
+        ).start()
+
     def shutdown(self):
         self._stop_event.set()
+        if self._bootstrap_server is not None:
+            self._bootstrap_server.shutdown()
+            self._bootstrap_server = None
         if self._nixl_handshake_listener_t is not None:
             self._nixl_handshake_listener_t.join()
             self._nixl_handshake_listener_t = None

@@ -60,6 +60,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
     hooks.
     """
 
+    kv_connector_mode: str = "push"
+
     def __init__(
         self,
         vllm_config: VllmConfig,
