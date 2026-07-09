@@ -152,6 +152,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             )
             assert meta.remote is not None
             remote_engine_id = meta.remote.engine_id
+            self.xfer_profiler.begin(
+                f"req:{req_id}", "WRITE-recv", engine=remote_engine_id
+            )
             logger.debug(
                 "start_load_kv (push) for request %s from remote engine %s. "
                 "Num local_block_ids: %s. Num remote_block_ids: %s. ",
@@ -393,6 +396,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             logger.warning("No local blocks to push for request %s", request_id)
             return
 
+        self.xfer_profiler.begin(
+            f"send:{request_id}", "WRITE", engine=decode_engine_id
+        )
         if not self._ensure_d_handshake(
             decode_engine_id,
             decode_host,
@@ -400,7 +406,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             registration_data["decode_tp_size"],
             request_id,
         ):
+            self.xfer_profiler.end(f"send:{request_id}", "handshake_failed")
             return
+        self.xfer_profiler.step(f"send:{request_id}", "handshake_ok")
 
         # Both sides are kept in logical form here; ``_xfer_blocks_for_req``
         # expands each side using the appropriate ratio.
@@ -424,6 +432,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         t0 = time.perf_counter()
         self._xfer_blocks_for_req(req_id=request_id, meta=push_meta)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        self.xfer_profiler.step(f"send:{request_id}", "write_posted")
         if elapsed_ms > 200.0:
             logger.warning(
                 "_do_start_push_kv for %s took %.1fms (slow NIXL submission)",
@@ -726,6 +735,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         with self._sending_transfers_lock:
             done_pushing = self._pop_done_transfers(self._sending_transfers)
         for req_id in done_pushing:
+            self.xfer_profiler.end(f"send:{req_id}", "push_done")
             self._reqs_to_send.pop(req_id, None)
             self._reqs_to_process.discard(req_id)
             self.consumer_notification_counts_by_req.pop(req_id, None)

@@ -50,6 +50,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # Remote block IDs are kept logical here; expanded in
             # _read_blocks_for_req using the remote engine's phys ratio.
             remote_engine_id = meta.remote.engine_id
+            self.xfer_profiler.begin(
+                f"req:{req_id}", "READ", engine=remote_engine_id
+            )
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
                 "Num local_block_ids: %s. Num remote_block_ids: %s. ",
@@ -64,6 +67,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 # Initiate handshake with remote engine to exchange metadata.
                 with self._handshake_lock:
                     if remote_engine_id not in self._remote_agents:
+                        self.xfer_profiler.step(f"req:{req_id}", "await_handshake")
                         self._background_nixl_handshake(req_id, remote_engine_id, meta)
                         continue
 
@@ -176,6 +180,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
             )
+
+        self.xfer_profiler.step(f"req:{req_id}", "read_posted")
 
         if self.use_mla and tp_ratio < 0 and read_specs:
             # ..but we still need to notify the other remote ranks that we

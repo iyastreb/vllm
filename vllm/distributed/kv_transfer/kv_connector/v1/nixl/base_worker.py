@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import zmq
 
+import vllm.envs as envs
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -53,6 +54,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
     zmq_ctx,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.xfer_profile import (
+    NixlXferProfiler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
     MambaConvSplitInfo,
@@ -511,6 +515,14 @@ class NixlBaseConnectorWorker:
             "enforce_handshake_compat", True
         )
 
+        # Diagnostic: INFO-level timeline of each transfer step (handshake,
+        # descriptor prep, READ/WRITE submission, completion). Enabled via
+        # VLLM_NIXL_XFER_PROFILE=1. Used to measure the initial xfer delay.
+        self.xfer_profiler = NixlXferProfiler(
+            role=f"{self.kv_transfer_config.kv_role or 'kv'}#r{self.tp_rank}",
+            enabled=envs.VLLM_NIXL_XFER_PROFILE,
+        )
+
     def _sync_block_size_with_kernel(self) -> None:
         backends = get_current_attn_backends(self.vllm_config)
         kernel_block_size = select_common_block_size(self.block_size, backends)
@@ -551,6 +563,11 @@ class NixlBaseConnectorWorker:
         if not self.use_host_buffer:
             current_platform.set_device(self.device_id)
 
+        hs_key = f"hs:{expected_engine_id}"
+        self.xfer_profiler.begin(
+            hs_key, "HANDSHAKE", host=host, port=port, remote_tp=remote_tp_size
+        )
+
         # When target instance TP > local TP, we need to perform multiple
         # handshakes. Do it in a single background job for simplicity.
         # Regardless, only handshake with the remote TP rank(s) that current
@@ -562,6 +579,7 @@ class NixlBaseConnectorWorker:
         path = make_zmq_path("tcp", host, port)
 
         with zmq_ctx(zmq.REQ, path) as sock:
+            self.xfer_profiler.step(hs_key, "zmq_ctx")
             for remote_rank in p_remote_ranks:
                 logger.debug(
                     "Querying metadata on path: %s at remote tp rank %s",
@@ -588,6 +606,7 @@ class NixlBaseConnectorWorker:
                     ) from e
 
                 got_metadata_time = time.perf_counter()
+                self.xfer_profiler.step(hs_key, f"meta_recv@r{remote_rank}")
                 logger.debug(
                     "NIXL handshake: get metadata took: %s",
                     got_metadata_time - start_time,
@@ -642,11 +661,13 @@ class NixlBaseConnectorWorker:
                     metadata, remote_rank, remote_tp_size
                 )
                 setup_agent_time = time.perf_counter()
+                self.xfer_profiler.step(hs_key, f"agent_added@r{remote_rank}")
                 logger.debug(
                     "NIXL handshake: add agent took: %s",
                     setup_agent_time - got_metadata_time,
                 )
                 remote_rank_to_agent_name[remote_rank] = remote_agent_name
+        self.xfer_profiler.end(hs_key, "complete")
         return remote_rank_to_agent_name
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -1494,9 +1515,12 @@ class NixlBaseConnectorWorker:
             group_spec_types=self._group_spec_types,
         )
 
+        hs_key = f"hs:{engine_id}"
+        self.xfer_profiler.step(hs_key, f"nixl_add_agent_start@r{remote_tp_rank}")
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
         )
+        self.xfer_profiler.step(hs_key, f"nixl_add_agent_done@r{remote_tp_rank}")
 
         # Create dst descs and xfer side handles. TP workers have same #blocks
         # so we only register once per engine_id.
@@ -1515,6 +1539,7 @@ class NixlBaseConnectorWorker:
             nixl_agent_meta.kv_caches_base_addr
         )
         self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+        self.xfer_profiler.step(hs_key, f"validated@r{remote_tp_rank}")
 
         # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
         # this is the ratio between the two sizes.
@@ -1550,6 +1575,7 @@ class NixlBaseConnectorWorker:
                 )
                 handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
                 self.src_xfer_handles_by_tp_ratio[tp_ratio].append(handle)
+        self.xfer_profiler.step(hs_key, f"local_splits_prepped@r{remote_tp_rank}")
 
         ### Register remote agent memory regions
         # With homogeneous TP, D pulls the whole kv cache from corresponding rank. With
@@ -1563,6 +1589,7 @@ class NixlBaseConnectorWorker:
             nixl_agent_meta,
             block_size_ratio,
         )
+        self.xfer_profiler.step(hs_key, f"fa_remote_built@r{remote_tp_rank}")
         logger.debug(
             "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
             len(blocks_data),
@@ -1586,9 +1613,11 @@ class NixlBaseConnectorWorker:
 
         # Register with NIXL.
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        self.xfer_profiler.step(hs_key, f"descs_built@r{remote_tp_rank}")
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
         )
+        self.xfer_profiler.step(hs_key, f"prep_dlist@r{remote_tp_rank}")
 
         if block_size_ratio > 1:
             # when prefill with smaller block_size, we need to init a
@@ -1915,6 +1944,10 @@ class NixlBaseConnectorWorker:
         block_ids_for_blocksize_post_process = defaultdict(list)
         block_ids_for_heterogeneous_attn_post_process = list[list[int]]()
         for req_id in done_recving:
+            self.xfer_profiler.end(
+                f"req:{req_id}",
+                "recv_failed" if req_id in failed_recv_reqs else "recv_done",
+            )
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
