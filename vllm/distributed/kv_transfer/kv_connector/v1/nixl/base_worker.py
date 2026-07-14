@@ -335,6 +335,9 @@ class NixlBaseConnectorWorker:
             )
 
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
+        self._use_async_xfer_completion = hasattr(
+            self.nixl_wrapper, "wait_xfer_any"
+        )
         # Map of engine_id -> {(pp_rank, tp_rank): agent_name, ...}.
         # non-PP remote uses pp_rank 0, i.e. (0, tp_rank).
         self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = defaultdict(
@@ -2058,16 +2061,37 @@ class NixlBaseConnectorWorker:
 
     def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
         """
-        Pop completed xfers by checking for DONE state.
+        Pop completed xfers.
         Args:
             transfers: dict of req_id -> list[running_xfer]
         Returns:
             set of req_ids that have all done xfers
         """
+        ready_handle_ids: set[int] | None = None
+        if self._use_async_xfer_completion:
+            all_handles = list(itertools.chain.from_iterable(transfers.values()))
+            if all_handles:
+                try:
+                    ready_handle_ids = {
+                        id(handle)
+                        for handle in self.nixl_wrapper.wait_xfer_any(
+                            all_handles, timeout_ms=0
+                        )
+                    }
+                except Exception:
+                    # Preserve the per-handle error handling below.
+                    ready_handle_ids = {id(handle) for handle in all_handles}
+
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = []
             for handle in handles:
+                if (
+                    ready_handle_ids is not None
+                    and id(handle) not in ready_handle_ids
+                ):
+                    in_progress.append(handle)
+                    continue
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                     if xfer_state == "DONE":

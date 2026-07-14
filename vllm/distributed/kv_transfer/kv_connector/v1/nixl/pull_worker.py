@@ -310,7 +310,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
 
             # Begin async xfer.
-            self.nixl_wrapper.transfer(handle)
+            self.nixl_wrapper.transfer(
+                handle, async_completion=self._use_async_xfer_completion
+            )
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)

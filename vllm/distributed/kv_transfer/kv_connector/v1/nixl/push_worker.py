@@ -665,7 +665,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_descs_ids,
                 notif_msg=notif_id,
             )
-            self.nixl_wrapper.transfer(handle)
+            self.nixl_wrapper.transfer(
+                handle, async_completion=self._use_async_xfer_completion
+            )
             # Caller tracks the handle (atomically with the request's other
             # writes) so P can free blocks once all of them are done.
             return handle
